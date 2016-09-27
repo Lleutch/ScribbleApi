@@ -17,4 +17,4 @@ if not exist paket.lock (
   .paket\paket.exe install
   @echo "Restoring dependencies"
   .paket\paket.exe restore
-)
+) 

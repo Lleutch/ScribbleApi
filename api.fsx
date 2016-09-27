@@ -20,7 +20,8 @@ let sendToServer json=
 let browse =
     request (fun r ->
         match r.queryParam "json" with
-        | Choice1Of2 json -> let (response:string) = sendToServer json
+        | Choice1Of2 json -> 
+                             let (response:string) = sendToServer json
                              let result = Parsing.getFSMJson response
                              match result with
                                 |None -> OK "SCRIBBLE_ERROR : either the code, the protocol name given or the local role is incorrect"
