@@ -46,6 +46,6 @@ let port = Sockets.Port.Parse <| getBuildParamOrDefault "port" "8083"
 
 let serverConfig = 
     {defaultConfig with
-        bindings = [ HttpBinding.mk HTTP IPAddress.Loopback port ]
+        bindings = [ HttpBinding.create HTTP IPAddress.Loopback port ]
     } 
 startWebServer serverConfig app 

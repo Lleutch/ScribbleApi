@@ -1,132 +1,239 @@
 #r "./packages/FSharp.Data/lib/net40/FSharp.Data.dll"
+#r "./packages/FParsec/lib/net40-client/FParsecCS.dll"
+#r "./packages/FParsec/lib/net40-client/FParsec.dll"
+
 open System
 open System.Text.RegularExpressions
+open FParsec
 
-type ArrayJson = FSharp.Data.JsonProvider<"""[{"result":" 1 -> 3 [ label=Me!World:hello() ]"}]""">
-type DiGraph = FSharp.Data.JsonProvider<""" {"result":"value"} """>
-type ScribbleProtocole = FSharp.Data.JsonProvider<""" [ { "currentState":0 , "localRole":"StringLocalRole" , "partner":"StringPartner" , "label":"StringLabel" , "payload":["StringTypes"] , "type":"EventType" , "nextState":0  } ] """>
-                    
+let printListJson (aList:string list) =
+    let length = aList.Length
+    List.fold
+        (fun (state,index) (elem:string) ->
+            (   if index < length then
+                    sprintf """%s"%s",""" state elem
+                else
+                    sprintf """%s"%s" """ state elem
+             ,index+1)
+        ) ("[",1) aList
+    |> fun (state,_) -> state + "]"
 
-//let json = ScribbleAPI.Root() //.Root(code = replace2 , proto = protocol ,role = localRole )
 
-let internal replaceRegex (pattern:string) (input:string) (replacement:string) =
-    Regex.Replace(input,pattern,replacement)
 
-let internal replaceString (old:string) (input:string) (newValue:string) =
-    input.Replace(old,newValue)
+type Current = Current of int
+type Role = Role of string
+type Partner = Partner of string
+type Label = Label of string
+type Payload = Payload of string List
+type EventType = EventType of string
+type Next = Next of int
 
-let getArrayJson (json:string) =
-    let s = DiGraph.Parse(json)
-    let s0 = s.Result
-    match Regex.IsMatch(s0,"java\\.lang\\.NullPointerException") with
+type Transition =
+    {
+        Current     : Current
+        Role        : Role
+        Partner     : Partner
+        Label       : Label
+        Payload     : Payload     
+        EventType   : EventType
+        Next        : Next
+    }
+    member this.Stringify() =
+        let (Current current)       = this.Current
+        let (Role role)             = this.Role
+        let (Partner partner)       = this.Partner
+        let (Label label)           = this.Label
+        let (Payload payload)       = this.Payload     
+        let (EventType eventType)   = this.EventType
+        let (Next next)             = this.Next
+
+        sprintf
+            """{ "currentState": %i , "localRole":"%s" , "partner":"%s" , "label":"%s" , "payload": %s , "type":"%s" , "nextState":%i  } """        
+            current
+            role
+            partner
+            label
+            (if payload.Length = 1 && payload.[0] = "" then
+                printListJson []
+             else
+                printListJson payload
+            )
+            eventType
+            next         
+
+type StateMachine =
+    | Transitions of Transition list
+    member this.Stringify() =
+        let (Transitions transitionList) = this
+        let length = transitionList.Length
+        List.fold
+            (fun (state,index) (transition:Transition) ->
+                (if index < length then
+                    state + (transition.Stringify()) + ",\n"
+                 else
+                    state + (transition.Stringify())                    
+                , index + 1)
+            ) ("[",1) transitionList
+        |> fun (state,_) -> state + "]"
+
+module parserHelper =
+    let brackets = ('{','}')
+    let squareBrackets = ('[',']')
+    let quotes = ('\"','\"')
+    let str_ws s = spaces >>. pstring s .>> spaces
+    let char_ws c = pchar c .>> spaces
+    let anyCharsTill pEnd = manyCharsTill anyChar pEnd
+    let anyCharsTillApply pEnd f = manyCharsTillApply anyChar pEnd f
+    let quoted quote parser = 
+        pchar (quote |> fst) 
+        .>> spaces >>. parser .>> spaces 
+        .>> pchar (quote |> snd) 
+    let line:Parser<string,unit> = anyCharsTill newline
+    let restOfLineAfter str = str_ws str >>. line
+    let startUpUseless:Parser<_,unit> = 
+        pstring "compound = true;" 
+        |> anyCharsTill
+        >>. skipNewline 
+         
+    let current:Parser<_,unit> = 
+        spaces 
+        >>. quoted quotes pint32 .>> spaces 
+        |>> Current
+    let next:Parser<_,unit> = 
+        spaces 
+        >>. quoted quotes pint32 .>> spaces 
+        |>> Next
+    
+    let partnerEvent:Parser<_,unit> =
+        str_ws "label"
+        >>. pstring "=" >>. spaces
+        >>. pchar '\"'
+        >>. (anyCharsTillApply (pchar '!' <|> pchar '?') (fun str event -> (str,event)))
+        |>> fun (str,event) -> 
+                match event with
+                | '!' -> 
+                    Partner(str),EventType("send")
+                | '?' ->
+                    Partner(str),EventType("receive")                
+                | _ ->
+                    failwith "This case can never happen, if these two weren't here the flow would
+                    have been broken earlier!!"
+
+    let label:Parser<_,unit> = 
+        spaces
+        >>. (anyCharsTill (pchar '('))
+        |>> Label
+    let payload:Parser<_,unit> =
+        let singlePayload =
+            spaces
+            >>. manyChars (noneOf [',';')'])
+        spaces
+        >>. between 
+                spaces 
+                (pstring ")\"" >>. spaces >>. pstring "];" >>. spaces) 
+                (sepBy singlePayload (pstring ",")) 
+        |>> Payload        
+   
+    let transition role currentState =
+        parse{
+            let! _ = pstring "->"
+            let! nextState = next
+            let! _ = pstring "["
+            let! partner,eventType = partnerEvent
+            let! label = label
+            let! payload = payload
+            return 
+                {
+                    Current     = currentState
+                    Role        = Role role
+                    Partner     = partner
+                    Label       = label
+                    Payload     = payload     
+                    EventType   = eventType
+                    Next        = nextState
+                } |> Some
+        }
+    let skipLabelInfoLine:Parser<Transition option,unit> =
+         parse{
+            let! _ = pstring "[" .>> spaces
+            let! _ = manyCharsTill anyChar (pstring "];")
+            let! _ = spaces
+            return None
+        }
+    let transitionOrSkipping role =
+        parse{
+            let! _ = spaces
+            let! currentState = current .>> spaces
+            return! transition role currentState <|> skipLabelInfoLine
+        }
+    let transitions role = 
+        parse{
+            let! _ = startUpUseless
+            do! spaces
+            let! list = (many (transitionOrSkipping role)) 
+            printfn "%A" list
+            return 
+                list 
+                |> List.filter Option.isSome 
+                |> List.map Option.get
+                |> Transitions
+        }
+module Parsing = 
+    open parserHelper
+    type ScribbleAPI = FSharp.Data.JsonProvider<""" { "code":"Code", "proto":"global protocol", "role":"local role" } """>
+    type DiGraph = FSharp.Data.JsonProvider<""" {"result":"value"} """>
+    type ScribbleProtocole = FSharp.Data.JsonProvider<""" [ { "currentState":0 , "localRole":"StringLocalRole" , "partner":"StringPartner" , "label":"StringLabel" , "payload":["StringTypes"] , "type":"EventType" , "nextState":0  } ] """>
+                        
+
+    let isCurrentChoice (fsm:ScribbleProtocole.Root []) (index:int) =
+        let current = fsm.[index].CurrentState
+        let mutable size = 0 
+        for elem in fsm do
+            if elem.CurrentState = current then
+                size <- size + 1
+        (size>1)
+
+    let modifyAllChoice (fsm:ScribbleProtocole.Root []) =
+        let mutable newArray = [||] 
+        for i in 0..(fsm.Length-1) do
+            let elem = fsm.[i]
+            if elem.Type = "receive" && (isCurrentChoice fsm i) then
+                let newElem = ScribbleProtocole.Root(elem.CurrentState,elem.LocalRole,elem.Partner,elem.Label,elem.Payload,"choice",elem.NextState)
+                newArray <- Array.append newArray [|newElem|]            
+            else
+            newArray <- Array.append newArray [|elem|]
+        newArray
+
+
+    let getArrayJson (response:string) json =
+        let s = DiGraph.Parse(response)
+        let s0 = s.Result
+        match Regex.IsMatch(s0,"java\\.lang\\.NullPointerException") with
         |true ->  None
-        |false ->   let oldValue = "digraph G {\ncompound = true;"
-                    let result = s0  
-                                    |> replaceString oldValue <|"[" 
-                                    |> replaceString "\n" <| "" 
-                                    |> replaceRegex "\"\d+\";" <| ""
-                                    |> replaceRegex "\"\s\];" <|" ]\"},"
-                                    |> replaceRegex "\"(\d+)\"\s->\s\"(\d+)\"" <| "{\"result\":\" $1 -> $2"
-                                    |> replaceRegex "\]\"\},\}" <| "]\"}]"
-                                    |> replaceRegex "label=\"" <| "label="
-                    Some result
-
-let modifyAllSame (c:ScribbleProtocole.Root []) (couple:int*int)  =
-    let mutable newArray = [||]
-    for elem in c do
-        match elem.NextState = (couple |> fst) with
-            | false -> newArray <- Array.append newArray [|elem|]  
-            | true -> let newElem = ScribbleProtocole.Root(elem.CurrentState,elem.LocalRole,elem.Partner,elem.Label,elem.Payload,elem.Type,(couple |> snd))
-                      newArray <- Array.append newArray [|newElem|]
-    newArray
-
-let isIn listIndex index = listIndex |> List.exists(fun x -> x = index)
-
-let isCurrentChoice (fsm:ScribbleProtocole.Root []) (index:int) =
-    let current = fsm.[index].CurrentState
-    let mutable size = 0 
-    for elem in fsm do
-        if elem.CurrentState = current then
-            size <- size + 1
-    (size>1)
-
-let modifyAllChoice (fsm:ScribbleProtocole.Root []) =
-    let mutable newArray = [||] 
-    for i in 0..(fsm.Length-1) do
-        let elem = fsm.[i]
-        if elem.Type = "receive" && (isCurrentChoice fsm i) then
-            let newElem = ScribbleProtocole.Root(elem.CurrentState,elem.LocalRole,elem.Partner,elem.Label,elem.Payload,"choice",elem.NextState)
-            newArray <- Array.append newArray [|newElem|]            
-        else
-        newArray <- Array.append newArray [|elem|]
-    newArray
-
-
-let getFSMJson (json:string) =
-    let mutable (listOfCouples:(int*int) list) = []
-    let arrayJson = getArrayJson json
-    match arrayJson with
-        |None -> None
-        |Some jsonvalue -> 
-                let arrayJsonString = ArrayJson.Parse(jsonvalue)
-                let json = new System.Text.StringBuilder()
-                json.Append("[") |> ignore
-                let size = arrayJsonString.Length
-                for i in 0..(size-1) do 
-                    let elem = arrayJsonString.[i]
-                    // Yeah I know, this regex is burning your eyes :)
-                    let regex = "\s(\d+)\s->\s(\d+)\s\[\slabel=(\w+)\[(\w+)\](\w+):(\w+)\(([\s*class\s*(\w+\\.\w+\[*\]*)\s*\\,*]*)\)\s*\]" 
-                    let typeOfMessage = if Regex.IsMatch(elem.Result,"\w+(\!)\w+:") then 
-                                            Regex.Replace(elem.Result,"(\w+)\!(\w+):","$1[send]$2:")
-                                        elif Regex.IsMatch(elem.Result,"\w+(\?)\w+:") then 
-                                            Regex.Replace(elem.Result,"(\w+)\?(\w+):","$1[receive]$2:")
-                                        elif Regex.IsMatch(elem.Result,"(\d+)\s*->\s*(\d+)\s*[\s*label=__tau()\s*]\s*") then // this is for epsilon transition
-                                            let matchReg = Regex.Match(elem.Result,"(\d+)\s*->\s*(\d+)\s*[\s*label=__tau()\s*]\s*")
-                                            let groups = matchReg.Groups
-                                            let current = System.Int32.Parse(groups.[1].Value)
-                                            let next = System.Int32.Parse(groups.[2].Value)
-                                            listOfCouples <- (current,next)::listOfCouples
-                                            ""
-                                        else
-                                            failwith (sprintf "There is a wrong type of method: expected '!' or '?' but received something different : %s " elem.Result ) 
-                    let mutable replace = "{\"currentState\": $1 , \"localRole\": \"$3\" , \"partner\": \"$5\" , \"label\": \"$6\" , \"payload\": [$7] , \"type\": \"$4\" , \"nextState\": $2 }"       
-                    if not(i=(size-1)) then
-                        replace <- sprintf "%s%s" replace ","
-                    let replaced = Regex.Replace(typeOfMessage,regex,replace)
-                    let regex2 = "\s*class\s*(\w+\\.\w+)\s*\\,"
-                    let replace2 = "\"$1\"," 
-                    let tmp = Regex.Replace(replaced,regex2,replace2)
-                    let regex3 = "\s*class\s*(\w+\\.\w+\[*\]*)\s*\]"
-                    let replace3 = "\"$1\"]" 
-                    let real = Regex.Replace(tmp,regex3,replace3)
-                    json.Append(real) |> ignore
-
-                json.Append("]") |> ignore
-                let tmpJson = Regex.Replace(json.ToString(),"\},\]","}]")
-                let newJson = new System.Text.StringBuilder(tmpJson)
-                let mutable jsonTyped = ScribbleProtocole.Parse(newJson.ToString()) 
-                for couple in listOfCouples do 
-                    jsonTyped <- modifyAllSame jsonTyped couple
-                let resultTyped = modifyAllChoice jsonTyped
-                let result = new System.Text.StringBuilder()
-                result.Append("[") |> ignore
-                let size = resultTyped.Length
-                for i in 0..(size-1) do 
-                    let elem = resultTyped.[i] 
-                    let length = elem.Payload.Length
-                    let payload = if (length = 0) then // ou si c'est 1
-                                    ""
-                                  elif (length = 1) then 
-                                    sprintf "\"%s\"" elem.Payload.[0]
-                                  else 
-                                    let first = sprintf "\"%s\"" elem.Payload.[0]
-                                    (elem.Payload.[1..(length-1)] |> Array.fold(fun acc x -> sprintf "%s,\"%s\"" acc x) first )
-                    let mutable tmpValue = sprintf "{\"currentState\": %d , \"localRole\": \"%s\" , \"partner\": \"%s\" , \"label\": \"%s\" , \"payload\": [%s] , \"type\": \"%s\" , \"nextState\": %d }"
-                                                elem.CurrentState elem.LocalRole elem.Partner elem.Label payload elem.Type elem.NextState
-                    if not(i=(size-1)) then
-                        tmpValue <- sprintf "%s%s" tmpValue ","
-                    result.Append(tmpValue) |> ignore
-
+        |false ->
+            let role = ScribbleAPI.Parse(json)
+            let test = run (transitions (role.Role) ) s0
+            match test with
+            | Failure (error,_,_) -> 
+                printfn "%s" error
+                None
+            | Success (res,_,_) ->
+                printfn "%s" (res.Stringify())
+                let res = ScribbleProtocole.Parse(res.Stringify())
+                let newRes = modifyAllChoice res
+                let finalRes =
+                    [ for tr in newRes do
+                        yield
+                            {
+                                Current     = tr.CurrentState |> Current
+                                Role        = tr.LocalRole |> Role
+                                Partner     = tr.Partner |> Partner
+                                Label       = tr.Label |> Label
+                                Payload     = tr.Payload |> List.ofArray |> Payload
+                                EventType   = tr.Type |> EventType
+                                Next        = tr.NextState |> Next
+                            }
+                    ] |> Transitions
+                Some (finalRes.Stringify())
                 
-                result.Append("]") |> ignore
-                Some (result.ToString())
+    let getFSMJson (json:string) = getArrayJson json
